@@ -1,0 +1,9 @@
+function env=adsr(decay_val, sustain_val, points, t)
+    % Creates an ADSR envelope.
+    % decay_val: in range <0, 1> amplitude decay target after attack
+    % sustain_val: sustain 
+    % points: [S A D S R] (1x5) in range <0,1>
+    values = [0 1 decay_val sustain_val 0];
+    points = points .* t(1, size(t, 2));
+    env = interp1(points, [0 values],t);
+end

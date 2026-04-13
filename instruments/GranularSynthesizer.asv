@@ -1,0 +1,159 @@
+classdef GranularSynthesizer
+    properties
+        fs
+    end
+    
+    methods
+        function obj = GranularSynthesizer(fs)
+            obj.fs = fs;
+        end
+        
+        function grain = make_grain_from(obj, input_sound, pos_s, length_s, pitch_shift_st, window_func)
+            start_pos = round(pos_s * obj.fs);
+            end_pos = round((pos_s + length_s) * obj.fs);
+            
+            grain_in = input_sound(:, start_pos:end_pos);
+            grain = obj.make_grain(grain_in, pitch_shift_st, window_func);
+        end
+        
+        function out = grain_layer(obj, input_sample, layer_cfg)
+            pitch_shift = layer_cfg.pitch_shift;
+            pitch_shift_variance = layer_cfg.pitch_shift_variance;
+            duration = layer_cfg.duration;
+            grain_length = layer_cfg.grain_length;
+            offset = layer_cfg.offset;
+            offset_variance = layer_cfg.offset_variance;
+            window_func = layer_cfg.window_func;
+            sample_pos = layer_cfg.sample_pos;
+            sample_pos_variance = layer_cfg.sample_pos_variance;
+            sample_pos_shift_per_grain = layer_cfg.sample_pos_shift_per_grain;
+            
+            in_len = size(input_sample, 2) / obj.fs;
+            duration_samples = duration * obj.fs;
+            out = zeros(size(input_sample, 1), duration_samples);
+            
+            write_pos = 1;
+            while (1)
+                pitch_shift = pitch_shift + obj.random_range(-pitch_shift_variance, pitch_shift_variance);
+                sample_pos = sample_pos + obj.random_range(-sample_pos_variance, sample_pos_variance);
+                sample_pos = sample_pos + sample_pos_shift_per_grain;
+                if sample_pos < 1
+                    sample_pos = 1 + mod(sample_pos - 1, in_len - grain_length);
+                end
+                if sample_pos >= in_len - grain_length
+                    sample_pos = 1 + mod(sample_pos, in_len - grain_length - 1);
+                end
+                grain = obj.make_grain_from(input_sample, sample_pos, grain_length, pitch_shift, window_func);
+                
+                output_grain_end = write_pos + size(grain, 2) - 1;
+                if output_grain_end > duration_samples
+                    break
+                end
+                out(:, write_pos:output_grain_end) = out(:, write_pos:output_grain_end) + grain;
+                
+                write_pos = write_pos + size(grain, 2) + floor(size(grain, 2) * (offset + obj.random_range(-offset_variance, offset_variance)));
+            end
+            out = out / max(out(:));
+        end
+        
+        function y = chord(obj, input_sample, duration, base_pitch_shift_st)
+            layer1_cfg.pitch_shift = base_pitch_shift_st;
+            layer1_cfg.pitch_shift_variance = 0;
+            layer1_cfg.duration = duration;
+            layer1_cfg.grain_length = 0.22;
+            layer1_cfg.offset = -0.4;
+            layer1_cfg.offset_variance = 0.1;
+            layer1_cfg.sample_pos = 0.0;
+            layer1_cfg.sample_pos_shift_per_grain = 0.1;
+            layer1_cfg.sample_pos_variance = 0;
+            layer1_cfg.window_func = @(t) obj.gauss_win(t, length(t)/10, layer1_cfg.grain_length * 0.5 * obj.fs);
+            
+            layer1 = obj.grain_layer(input_sample, layer1_cfg);
+            
+            layer2_cfg = layer1_cfg;
+            layer2_cfg.pitch_shift = base_pitch_shift_st + 12;
+            layer2_cfg.pitch_shift_variance = 0;
+            layer2_cfg.grain_length = 0.3;
+            layer2_cfg.offset = -0.5;
+            layer2_cfg.offset_variance = 0.24;
+            layer2_cfg.sample_pos = 0.5;
+            layer2_cfg.sample_pos_shift_per_grain = 0;
+            layer2_cfg.sample_pos_variance = 0.2;
+            
+            layer2 = obj.grain_layer(input_sample, layer2_cfg);
+            
+            layer3_cfg = layer2_cfg;
+            layer3_cfg.pitch_shift = base_pitch_shift_st + 29;
+            layer3_cfg.grain_length = 0.2;
+            
+            layer3 = obj.grain_layer(input_sample, layer3_cfg);
+            
+            y = layer1 * 0.7 + layer2 * 0.4 + layer3 * 0.3;
+            
+            t = 1:size(y, 2);
+            y = y .* repmat(adsr(0.7, 0.6, [0 0.4, 0.6, 0.9, 1], t), size(y, 1), 1);
+        end
+    end
+
+    methods(Static)
+        function win = gauss_win(t, sigma, mu)
+            win = 1 / (sigma * sqrt(2 * pi)) * exp(-(t - mu).^2 / (2 * sigma^2));
+        end 
+    end
+    
+    methods(Static, Access=private)
+        function grain = make_grain(input, pitch_shift_st, window_func)
+            if (pitch_shift_st ~= 0)
+                pitch_shifted = pitch_shift(input, pitch_shift_st, 64);
+            else 
+                pitch_shifted = input;
+            end
+            
+            out_len = min(size(input, 2), size(pitch_shifted, 2));
+            t = 0:out_len-1;
+            window = window_func(t);
+            grain = window .* pitch_shifted(:, 1:out_len);                                      
+            grain = grain / 0.0013 * 0.75;
+        end
+
+        function x = random_range(a, b)
+            x = (b-a).*rand(1) + a;
+        end
+    end
+
+    function out = custom_pitch_shift()
+        vocoder = PhaseVocoder(@gausswin, 2048);
+        % vocoder.window_shift = 2048/32;
+    
+        % Compute the shift ratio
+       
+        N1 = round(vocoder.window_shift); % Original window shift
+        N2 = round(2^(pitch_shift_st / 12) * N1); % New window shift after semitone shift 
+        R = N2 / N1;                      % Ratio for resampling
+    
+        X_all_ch = vocoder.analyze(input);
+        
+        num_ch = size(input, 1);
+        for ch = 1:num_ch
+            X = squeeze(X_all_ch(:, ch, :));
+            Xmag = interp1q((0:size(X, 2)-1)', abs(X'), (0:1/R:size(X, 2)-2)');  % Interpolate magnitudes for pitch-shifting
+            new_grid = floor(0:1/R:size(X, 2)-2) + 1;  % Map new grid points to the original
+            D = diff(angle(X'))';  % Compute phase differences between consecutive frames
+            D_new = D(:, new_grid);  % Map the phase differences to the new time grid
+            phaseX = cumsum(D_new');  % Integrate phase differences to reconstruct phase
+            
+            Y = (Xmag .* exp(1i * phaseX))';
+            if (ch == 1)
+                Y_all_ch = zeros(size(Y, 1), num_ch, size(Y, 2));
+            end
+            Y_all_ch(:, ch, :) = Y;
+        end
+        
+        signal = vocoder.synthesize(Y_all_ch);
+        out = zeros(size(input));
+        for ch = 1:num_ch
+            resampled = resample(signal(ch, :), N1, N2);  % Adjust the pitch using resampling
+            out(ch, 1:size(resampled, 2)) = resampled;
+        end
+    end
+end
